@@ -16,9 +16,9 @@ import os
 import os
 # 특정 GPU 번호를 지정하여 CUDA_VISIBLE_DEVICES 환경 변수 설정
 os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+import pandas as pd
 
-
-
+from collections import Counter
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import KFold
 from tensorboardX import SummaryWriter
@@ -46,16 +46,23 @@ class STFTDataLoader(Dataset):
     def __getitem__(self, idx):
         sample_image = self.image[idx]
 
-        sample_image = cv2.cvtColor(sample_image, cv2.COLOR_BGR2RGB)
         if self.mode == 'train':
+            sample_image = cv2.cvtColor(sample_image, cv2.COLOR_BGR2RGB)
             if self.transform:
                 sample_image = self.transform(sample_image)
             return sample_image
 
         elif self.mode == 'val':
+            sample_image = cv2.cvtColor(sample_image, cv2.COLOR_BGR2RGB)
             sample_image = self.transform(sample_image)
             return sample_image
 
+        elif self.mode == 'test':
+            sample_image = np.array(sample_image, dtype=np.float32)
+            sample_image = cv2.cvtColor(sample_image, cv2.COLOR_BGR2RGB)
+            sample_image = self.transform(sample_image)
+            return sample_image
+            
 
 # Define the autoencoder model
 class ConvAutoencoder(nn.Module):
@@ -82,7 +89,8 @@ class ConvAutoencoder(nn.Module):
         return x
 
 
-def main():
+
+def train():
     learning_rate = 1e-4
     random_seed = 41
     batch_size = 16
@@ -131,13 +139,15 @@ def main():
     criterion = nn.MSELoss()
     # criterion = nn.BCELoss()
 
-    optimizer = optim.Adam(model.parameters(), lr=lr)
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     
 
 
     # 모델 학습
     global_step = 0
     num_fold = 5
+    total_error = []
+    val_error_ep = []
     for fold, (train_indices, val_indices) in enumerate(kf.split(raw_stft)): # raw_stft의 shape: (1613, 128, 128, 3)
         if fold == 1: break
 
@@ -150,7 +160,7 @@ def main():
         val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, pin_memory=True)
 
         total_steps = len(train_loader)
-        for epoch in range(1, epochs+1):
+        for epoch in range(1, num_epochs+1):
             # if epoch == 5: break
             training_loss = 0
             model.train()
@@ -179,11 +189,12 @@ def main():
 
                 if step % 10 == 0:
                     train_image = torchvision.utils.make_grid(sample)
-                    writer.add_scalar("Training/Loss", avg_train_loss, epoch)
+                    writer.add_scalar("Training/Loss", training_loss, epoch)
+                    writer.add_scalar("Training/Learning Rate", learning_rate, epoch)
                     writer.add_image('Training/Input_Image/', train_image, global_step=global_step)
 
 
-                    sys.stdout.write(f"\rEpoch: {epoch} \t | step: {step+1}/{total_steps} \t | Average Train Loss: {avg_train_loss:.4f}")
+                    sys.stdout.write(f"\rEpoch: {epoch} \t | step: {step+1}/{total_steps} \t | Average Train Loss: {training_loss:.4f}")
                     sys.stdout.flush()
                     time.sleep(0)
             print()
@@ -193,7 +204,7 @@ def main():
             model.eval()
             with torch.no_grad():
                 avg_val_loss = 0
-                score_arr = []
+                errors = []
                 for num, val_sample in enumerate(val_loader):
                     val_sample = val_sample.to(device)
 
@@ -207,25 +218,162 @@ def main():
                     writer.add_image("Validation/Reconstructed_Image", pred, epoch)
 
                     # Mean Absolute Error (MAE)
-                    erro = torch.mean(torch.abs(val_prediction - val_sample), axis=1)
-                    erro_arr.append(erro.cpu().numpy())
+                    error = torch.mean(torch.abs(val_prediction - val_sample), axis=0)
+                    error = torch.mean(error)
+                    errors.append(error.cpu().numpy())
 
-                erro_arr = np.array(erro_arr)
-                print(erro_arr.max())
+                errors = np.mean(np.array(errors))
+                total_error.append(errors)
+                
                 avg_val_loss = avg_val_loss / len(val_loader)
-                sys.stdout.write(f"\rValidation Result: Average Val Loss: {avg_val_loss:.4f}")
-                sys.stdout.flush()
-
                 writer.add_scalar("Validation/Loss", avg_val_loss, epoch)
 
             print()
-
+            
+            val_error_ep.append(error)
+            
             global_step += 1
-            torch.save({'model_state_dict': model.state_dict(),
-                        'optimizer_state_dict': optimizer.state_dict()},
-                        f'{log_dir}/CAE_checkpoint_{epoch}.pth')
-
+            if len(val_error_ep) > 1 and (val_error_ep[-1] < min(val_error_ep[:-1])):
+                sys.stdout.write(f"\rValidation Result: Average Val Loss: {avg_val_loss:.4f}")
+                sys.stdout.flush()
+                
+                torch.save({'model_state_dict': model.state_dict(),
+                            'optimizer_state_dict': optimizer.state_dict()},
+                            f'{log_dir}/CAE_checkpoint_{epoch}.pth')
+        
     print('Finished Training')
+
+
+
+def get_pred_label(model_pred, t):
+    # (0:정상, 1:불량)로 Label 변환
+    model_pred = np.where(model_pred <= t, 0, model_pred)
+    model_pred = np.where(model_pred > t, 1, model_pred)
+    return model_pred
+
+
+
+def test():
+    import matplotlib.pyplot as plt
+    from sklearn.manifold import TSNE
     
+    pth = 'CAE_checkpoint_88.pth'
+    test_folder = 'stft_try2'
+    
+    raw_stft = np.load('./DATASET/stft_image_dataset.npy')
+    test_stft = np.load(osp.join(os.getcwd(), 'DATASET', 'stft_image_test_dataset.npy'))
+
+
+    transform = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Resize((128, 128))
+    ])
+    test_dataset = STFTDataLoader(test_stft, mode='test', transform=transform)
+    test_dataloader = DataLoader(test_dataset, batch_size=1, shuffle=False)
+    
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    checkpoint = torch.load(osp.join(os.getcwd(), 'logs', test_folder, pth), map_location=device)
+
+    model = ConvAutoencoder()
+    model.load_state_dict(checkpoint['model_state_dict'])
+    model.to('cuda')
+    model.eval()
+
+    test_scores = []
+    # latent_vectors = []
+    for num, test_image in enumerate(test_dataloader):
+        test_image = torch.tensor(test_image, dtype=torch.float32, device=device)
+        
+        test_pred = model(test_image) # model prediction
+        # z = model.encoder(test_image)
+        
+        # latent_vectors.append(z.cpu().detach().numpy())
+        
+        # MAE
+        # error = torch.abs(test_image - test_pred)
+        # score = torch.mean(torch.mean(error.squeeze(), axis=0))
+        # mean_scores.append(score.detach().cpu().item())
+        error = torch.mean(torch.abs(test_pred - test_image), axis=(1, 2, 3))
+        # error = torch.mean(error)
+        # train_score.append(error.cpu().item())
+        test_scores.append(error.detach().cpu().numpy())
+    
+    test_scores = np.concatenate(test_scores, axis=0)
+    # latent_vectors = np.concatenate(latent_vectors, axis=0)
+    # # 잠재 벡터를 2차원으로 축소하여 시각화
+    # # tsne = TSNE(n_components=2, perplexity=10, random_state=0)
+    # tsne = TSNE(n_components=2, random_state=0)
+    # latent_tsne = tsne.fit_transform(latent_vectors.reshape(1510, -1))
+
+    # # 시각화
+    # plt.figure(figsize=(10, 8))
+    # plt.scatter(latent_tsne[:, 0], latent_tsne[:, 1], cmap='viridis')
+    # plt.colorbar()
+    # plt.xlabel('TSNE Dimension 1')
+    # plt.ylabel('TSNE Dimension 2')
+    # plt.title('Latent Space Visualization')
+    # plt.savefig('./test_tsne.png')
+    
+    train_transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.RandomResizedCrop(size=(128, 128))
+
+    ])
+    # kf = KFold(n_splits=5, shuffle=True)
+    # for fold, (train_indices, val_indices) in enumerate(kf.split(raw_stft)): # raw_stft의 shape: (1613, 128, 128, 3)
+    #     if fold == 1: break
+        
+    train_dataset = STFTDataLoader(image=raw_stft, mode='train', transform=train_transform)
+    train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True, pin_memory=True)
+    
+    train_score = []
+    train_latent_vectors = []
+    for step, sample in enumerate(train_loader):
+        sample = torch.tensor(sample, dtype=torch.float32, device=device)
+        prediction = model(sample)
+        
+        # z = model.encoder(sample)
+        # train_latent_vectors.append(z.cpu().detach().numpy())
+        
+        # Mean Absolute Error (MAE)
+        error = torch.mean(torch.abs(prediction - sample), axis=(1, 2, 3))
+        # error = torch.mean(error)
+        # train_score.append(error.cpu().item())
+        # error = torch.mean(error)
+        train_score.append(error.detach().cpu().numpy())
+        # train_score.append(error.detach().cpu().item())
+        
+        
+    # train_latent_vectors = np.concatenate(train_latent_vectors, axis=0)
+    # # 잠재 벡터를 2차원으로 축소하여 시각화
+    # # tsne = TSNE(n_components=2, perplexity=10, random_state=0)
+    # tsne = TSNE(n_components=2, random_state=0)
+    # latent_tsne = tsne.fit_transform(train_latent_vectors.reshape(1277, -1))
+
+    # # 시각화
+    # plt.figure(figsize=(10, 8))
+    # plt.scatter(latent_tsne[:, 0], latent_tsne[:, 1], cmap='viridis')
+    # plt.colorbar()
+    # plt.xlabel('TSNE Dimension 1')
+    # plt.ylabel('TSNE Dimension 2')
+    # plt.title('Latent Space Visualization')
+    # # plt.show()
+    # plt.savefig('./train_tsne.png')
+    
+    train_score = np.concatenate(train_score, axis=0)
+    # train_score = np.array(train_score)
+    t = max(train_score)
+    result = get_pred_label(model_pred=test_scores, t=t)
+    print(Counter(result))
+
+    submit = pd.read_csv('./DATASET/sample_submission.csv')
+    submit['LABEL'] = result
+    print(submit.head())
+    submit.to_csv('./DATASET/summit.csv', index=False)
+
+
 if __name__ == "__main__":
-    main()
+    # train()
+    test()
